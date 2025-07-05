@@ -1,5 +1,9 @@
 # Unmute
 
+
+Modified to work on docker with windows and ollama - run start-windows.bat (Make sure you have ollama installed) 
+
+
 Try it out at [Unmute.sh](https://unmute.sh)!
 
 Unmute is a system that allows text LLMs to listen and speak by wrapping them in Kyutai's Text-to-speech and Speech-to-text models.
