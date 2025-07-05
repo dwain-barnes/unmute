@@ -1,7 +1,7 @@
 # Unmute
 
 
-#Modified to work on docker with windows and ollama - run start-windows.bat (Make sure you have ollama installed) 
+# Modified to work on docker with windows and ollama - run start-windows.bat (Make sure you have ollama installed) 
 
 
 Try it out at [Unmute.sh](https://unmute.sh)!
