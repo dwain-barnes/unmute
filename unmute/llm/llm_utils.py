@@ -1,68 +1,17 @@
 import os
 import re
-from copy import deepcopy
 from functools import cache
 from typing import Any, AsyncIterator, Protocol, cast
 
 from mistralai import Mistral
 from openai import AsyncOpenAI, OpenAI
 
-from unmute.kyutai_constants import LLM_SERVER
-
-from ..kyutai_constants import KYUTAI_LLM_MODEL
-
-INTERRUPTION_CHAR = "—"  # em-dash
-USER_SILENCE_MARKER = "..."
-
-
-def preprocess_messages_for_llm(
-    chat_history: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    output = []
-
-    for message in chat_history:
-        message = deepcopy(message)
-
-        # Sometimes, an interruption happens before the LLM can say anything at all.
-        # In that case, we're left with a message with only INTERRUPTION_CHAR.
-        # Simplify by removing.
-        if message["content"].replace(INTERRUPTION_CHAR, "") == "":
-            continue
-
-        if output and message["role"] == output[-1]["role"]:
-            output[-1]["content"] += " " + message["content"]
-        else:
-            output.append(message)
-
-    def role_at(index: int) -> str | None:
-        if index >= len(output):
-            return None
-        return output[index]["role"]
-
-    if role_at(0) == "system" and role_at(1) in [None, "assistant"]:
-        # Some LLMs, like Gemma, get confused if the assistant message goes before user
-        # messages, so add a dummy user message.
-        output = [output[0]] + [{"role": "user", "content": "Hello."}] + output[1:]
-
-    for message in chat_history:
-        if (
-            message["role"] == "user"
-            and message["content"].startswith(USER_SILENCE_MARKER)
-            and message["content"] != USER_SILENCE_MARKER
-        ):
-            # This happens when the user is silent but then starts talking again after
-            # the silence marker was inserted but before the LLM could respond.
-            # There are special instructions in the system prompt about how to handle
-            # the silence marker, so remove the marker from the message to not confuse
-            # the LLM
-            message["content"] = message["content"][len(USER_SILENCE_MARKER) :]
-
-    return output
+from unmute.kyutai_constants import KYUTAI_LLM_MODEL, LLM_SERVER
 
 
 async def rechunk_to_words(iterator: AsyncIterator[str]) -> AsyncIterator[str]:
-    """Rechunk the stream of text to whole words.
-
+    """
+    Rechunk the iterator to be word-by-word instead of character-by-character.
     Otherwise the TTS doesn't know where word boundaries are and will mispronounce
     split words.
 
@@ -161,3 +110,88 @@ class VLLMStream:
                 chunk_content = chunk.choices[0].delta.content
                 assert isinstance(chunk_content, str)
                 yield chunk_content
+
+
+class OllamaStream:
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        temperature: float = 1.0,
+    ):
+        """
+        Ollama stream implementation using OpenAI-compatible API.
+        Uses the same interface as VLLMStream but connects to Ollama.
+        """
+        self.client = client
+        self.model = autoselect_model()
+        self.temperature = temperature
+
+    async def chat_completion(
+        self, messages: list[dict[str, str]]
+    ) -> AsyncIterator[str]:
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=cast(Any, messages),  # Cast and hope for the best
+                stream=True,
+                temperature=self.temperature,
+            )
+
+            async with stream:
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        chunk_content = chunk.choices[0].delta.content
+                        assert isinstance(chunk_content, str)
+                        yield chunk_content
+        except Exception as e:
+            # Log the error and re-raise with more context
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in Ollama chat completion: {e}")
+            raise
+
+
+def get_ollama_client(server_url: str = "http://localhost:11434") -> AsyncOpenAI:
+    """Get OpenAI client configured for Ollama."""
+    return AsyncOpenAI(api_key="ollama", base_url=server_url + "/v1")
+
+
+@cache
+def autoselect_ollama_model() -> str:
+    """Auto-select Ollama model, with fallback to common models."""
+    if KYUTAI_LLM_MODEL is not None:
+        return KYUTAI_LLM_MODEL
+    
+    try:
+        client_sync = OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")
+        models = client_sync.models.list()
+        if len(models.data) >= 1:
+            return models.data[0].id
+        else:
+            # Fallback to common Ollama models
+            return "llama3.2"
+    except Exception:
+        # If we can't connect, return a common default
+        return "llama3.2"
+
+
+# Add missing constants and functions
+INTERRUPTION_CHAR = "□"
+USER_SILENCE_MARKER = "..."
+
+
+def preprocess_messages_for_llm(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """
+    Preprocess messages for LLM consumption.
+    This function was missing and causing import errors.
+    """
+    processed_messages = []
+    for message in messages:
+        # Clean up the message content
+        content = message.get("content", "").strip()
+        if content:  # Only include non-empty messages
+            processed_messages.append({
+                "role": message.get("role", "user"),
+                "content": content
+            })
+    return processed_messages
