@@ -1,19 +1,16 @@
-# See NOTE comments for places to modify.
 services:
   traefik:
     image: traefik:v3.3.1
     command:
-      # Swarm provider configuration
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-
-      # This is set up for HTTP. If you want HTTPS support for production, use Docker Swarm
-      # (check out swarm-deploy.yml) or ask ChatGPT to modify this file for you.
       - "--entrypoints.web.address=:80"
     ports:
       - "80:80"
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - unmute-network
 
   frontend:
     image: unmute-frontend:latest
@@ -27,7 +24,9 @@ services:
       - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
       - "traefik.http.routers.frontend.entrypoints=web"
       - "traefik.http.services.frontend.loadbalancer.server.port=3000"
-      - "traefik.http.routers.frontend.priority=10" # lowest priority
+      - "traefik.http.routers.frontend.priority=10"
+    networks:
+      - unmute-network
 
   backend:
     image: unmute-backend:latest
@@ -39,8 +38,9 @@ services:
     environment:
       - KYUTAI_STT_URL=ws://stt:8080
       - KYUTAI_TTS_URL=ws://tts:8080
-      - KYUTAI_LLM_URL=http://llm:8000
-      - NEWSAPI_API_KEY=$NEWSAPI_API_KEY
+      - KYUTAI_LLM_URL=http://host.docker.internal:11434
+      - KYUTAI_LLM_MODEL=llama3.2
+      - NEWSAPI_API_KEY=${NEWSAPI_API_KEY:-}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.backend.rule=PathPrefix(`/api`)"
@@ -49,8 +49,13 @@ services:
       - "traefik.http.middlewares.strip-api.replacepathregex.replacement=/$$1"
       - "traefik.http.routers.backend.entrypoints=web"
       - "traefik.http.services.backend.loadbalancer.server.port=80"
-      - "traefik.http.routers.backend.priority=100" # higher priority than frontend
+      - "traefik.http.routers.backend.priority=100"
       - "prometheus-port=80"
+    depends_on:
+      - stt
+      - tts
+    networks:
+      - unmute-network
 
   tts:
     image: moshi-server:latest
@@ -59,12 +64,12 @@ services:
       context: services/moshi-server
       dockerfile: public.Dockerfile
     environment:
-      - HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
     volumes:
       - ./volumes/cargo-registry-tts:/root/.cargo/registry
       - ./volumes/tts-target:/app/target
       - ./volumes/uv-cache:/root/.cache/uv
-      - /tmp/models/:/models
+      - ./volumes/models:/models
       - ./volumes/tts-logs:/logs
     deploy:
       resources:
@@ -73,6 +78,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    networks:
+      - unmute-network
 
   stt:
     image: moshi-server:latest
@@ -81,12 +88,12 @@ services:
       context: services/moshi-server
       dockerfile: public.Dockerfile
     environment:
-      - HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
     volumes:
       - ./volumes/cargo-registry-stt:/root/.cargo/registry
       - ./volumes/stt-target:/app/target
       - ./volumes/uv-cache:/root/.cache/uv
-      - /tmp/models/:/models
+      - ./volumes/models:/models
       - ./volumes/stt-logs:/logs
     deploy:
       resources:
@@ -95,34 +102,9 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
-  llm:
-    image: vllm/vllm-openai:v0.9.1
-    command:
-      [
-        # NOTE: Change the LLM here if you want.
-        # (caution: gemma-3-1b-it also exists but it's slow on vLLM: https://github.com/vllm-project/vllm/issues/19575)
-        "--model=meta-llama/Llama-3.2-1B-Instruct",
-        # NOTE: You can adapt this based on your GPU memory.
-        # A higher value takes more memory but supports longer conversations.
-        "--max-model-len=1536",
-        "--dtype=bfloat16",
-        # NOTE: Change this based on your GPU memory.
-        # A higher value can make inference faster.
-        "--gpu-memory-utilization=0.4",
-      ]
-    volumes:
-      - ./volumes/huggingface-cache:/root/.cache/huggingface"
-      - ./volumes/vllm-cache:/root/.cache/vllm
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    networks:
+      - unmute-network
 
 networks:
-  default:
+  unmute-network:
+    driver: bridge
