@@ -94,6 +94,8 @@ class UnmuteHandler(AsyncStreamHandler):
         self.stt_last_message_time: float = 0
         self.stt_end_of_flush_time: float | None = None
         self.stt_flush_timer = Stopwatch()
+        self.stt_reconnect_attempts = 0
+        self.max_stt_reconnect_attempts = 3
 
         self.tts_voice: str | None = None  # Stored separately because TTS is restarted
         self.tts_output_stopwatch = Stopwatch()
@@ -124,9 +126,18 @@ class UnmuteHandler(AsyncStreamHandler):
     def stt(self) -> SpeechToText | None:
         try:
             quest = self.quest_manager.quests["stt"]
+            logger.debug(f"STT quest found: {quest}")
         except KeyError:
+            logger.warning("STT quest not found in quest manager")
             return None
-        return cast(Quest[SpeechToText], quest).get_nowait()
+        
+        try:
+            result = cast(Quest[SpeechToText], quest).get_nowait()
+            logger.debug(f"STT quest result: {result}")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get STT from quest: {e}")
+            return None
 
     @property
     def tts(self) -> TextToSpeech | None:
@@ -134,7 +145,12 @@ class UnmuteHandler(AsyncStreamHandler):
             quest = self.quest_manager.quests["tts"]
         except KeyError:
             return None
-        return cast(Quest[TextToSpeech], quest).get_nowait()
+        
+        try:
+            return cast(Quest[TextToSpeech], quest).get_nowait()
+        except Exception as e:
+            logger.warning(f"Failed to get TTS from quest: {e}")
+            return None
 
     def get_gradio_update(self):
         self.debug_dict["conversation_state"] = self.chatbot.conversation_state()
@@ -277,9 +293,40 @@ class UnmuteHandler(AsyncStreamHandler):
         """
         return self.n_samples_received / self.input_sample_rate
 
-    async def receive(self, frame: tuple[int, np.ndarray]) -> None:
+    async def ensure_stt_connection(self) -> SpeechToText | None:
+        """Ensure STT connection is available, with retry logic."""
         stt = self.stt
-        assert stt is not None
+        if stt is not None:
+            return stt
+        
+        if self.stt_reconnect_attempts >= self.max_stt_reconnect_attempts:
+            logger.error(f"Max STT reconnect attempts ({self.max_stt_reconnect_attempts}) reached")
+            return None
+            
+        logger.warning(f"STT connection lost, attempting to reconnect (attempt {self.stt_reconnect_attempts + 1})")
+        self.stt_reconnect_attempts += 1
+        
+        try:
+            await self.start_up_stt()
+            stt = self.stt
+            if stt is not None:
+                logger.info("STT reconnection successful")
+                self.stt_reconnect_attempts = 0  # Reset counter on successful reconnect
+                return stt
+            else:
+                logger.error("STT reconnection failed - stt is still None")
+                return None
+        except Exception as e:
+            logger.error(f"STT reconnection failed with exception: {e}")
+            return None
+
+    async def receive(self, frame: tuple[int, np.ndarray]) -> None:
+        # Enhanced STT connection handling with retry logic
+        stt = await self.ensure_stt_connection()
+        if stt is None:
+            logger.error("STT connection unavailable, skipping frame")
+            return
+            
         sr = frame[0]
         assert sr == self.input_sample_rate
 
@@ -333,7 +380,15 @@ class UnmuteHandler(AsyncStreamHandler):
         if self.chatbot.conversation_state() == "user_speaking":
             self.debug_dict["timing"] = {}
 
-        await stt.send_audio(array)
+        # Safe audio sending with error handling
+        try:
+            await stt.send_audio(array)
+        except Exception as e:
+            logger.error(f"Failed to send audio to STT: {e}")
+            # Mark STT as needing reconnection
+            self.stt_reconnect_attempts = 0
+            return
+
         if self.stt_end_of_flush_time is None:
             await self.detect_long_silence()
 
@@ -348,7 +403,11 @@ class UnmuteHandler(AsyncStreamHandler):
                 )  # some safety margin.
                 zero = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
                 for _ in range(num_frames):
-                    await stt.send_audio(zero)
+                    try:
+                        await stt.send_audio(zero)
+                    except Exception as e:
+                        logger.error(f"Failed to send zero audio to STT: {e}")
+                        break
             elif (
                 self.chatbot.conversation_state() == "bot_speaking"
                 and stt.pause_prediction.value < 0.4
@@ -431,7 +490,11 @@ class UnmuteHandler(AsyncStreamHandler):
 
         quest = await self.quest_manager.add(Quest("stt", _init, _run, _close))
         # We want to be sure to have the STT before starting anything.
-        await quest.get()
+        try:
+            await quest.get()
+        except Exception as e:
+            logger.error(f"Failed to start STT: {e}")
+            raise
 
     async def _stt_loop(self, stt: SpeechToText):
         try:
@@ -466,6 +529,9 @@ class UnmuteHandler(AsyncStreamHandler):
                     await self.output_queue.put(ora.InputAudioBufferSpeechStarted())
         except websockets.ConnectionClosed:
             logger.info("STT connection closed while receiving messages.")
+        except Exception as e:
+            logger.error(f"STT loop error: {e}")
+            raise
 
     async def start_up_tts(self, generating_message_i: int) -> Quest[TextToSpeech]:
         async def _init() -> TextToSpeech:
